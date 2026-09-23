@@ -1,0 +1,113 @@
+name: labs-deploy
+
+on:
+  workflow_call:
+    inputs:
+      labs-url:
+        description: Base URL of the labs Worker
+        type: string
+        default: https://labs.imgly-labs.workers.dev
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.find.outputs.projects }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          projects=$(find . -name .imgly-labs.json -not -path '*/node_modules/*' -not -path './.git/*' -printf '%h\n' \
+            | sed 's#^\./##' | sort | jq -R . | jq -sc .)
+          echo "Found projects: $projects"
+          echo "projects=$projects" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: discover
+    if: github.ref == 'refs/heads/main' && needs.discover.outputs.projects != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.discover.outputs.projects) }}
+    name: deploy ${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build
+        working-directory: ${{ matrix.project }}
+        run: |
+          build=$(jq -r '.build // empty' .imgly-labs.json)
+          if [ -z "$build" ]; then echo "No build step"; exit 0; fi
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          elif [ -f package.json ]; then npm install
+          fi
+          bash -c "$build"
+
+      - name: Deploy
+        env:
+          PROJECT_DIR: ${{ matrix.project }}
+          LABS_URL: ${{ inputs.labs-url }}
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFile, readFile, readdir } from "node:fs/promises";
+          import path from "node:path";
+
+          const dir = process.env.PROJECT_DIR;
+          const labs = process.env.LABS_URL;
+          const configText = await readFile(path.join(dir, ".imgly-labs.json"), "utf8");
+          const config = JSON.parse(configText);
+          const assetsDir = path.join(dir, config.assets ?? ".");
+          const SKIP = new Set([".git", ".github", "node_modules"]);
+
+          async function* walk(d) {
+            for (const e of await readdir(d, { withFileTypes: true })) {
+              if (SKIP.has(e.name)) continue;
+              const p = path.join(d, e.name);
+              if (e.isDirectory()) yield* walk(p);
+              else if (e.isFile()) yield p;
+            }
+          }
+
+          const form = new FormData();
+          form.append("config", configText);
+          form.append("path", dir);
+          let count = 0;
+          for await (const file of walk(assetsDir)) {
+            const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
+            if (rel === "/.imgly-labs.json") continue;
+            form.append(`file:${rel}`, new Blob([await readFile(file)]), path.basename(file));
+            count++;
+          }
+
+          const idRes = await fetch(
+            `${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encodeURIComponent(labs)}`,
+            { headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` } }
+          );
+          const { value: token } = await idRes.json();
+
+          const res = await fetch(`${labs}/deploy`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}` },
+            body: form,
+          });
+          const text = await res.text();
+          if (!res.ok) {
+            console.log(`::error::Deploy of ${dir} failed (${res.status}): ${text}`);
+            process.exit(1);
+          }
+          const out = JSON.parse(text);
+          console.log(`Deployed ${count} files`);
+          console.log(`Share: ${out.url}`);
+          console.log(`Direct: ${out.projectUrl}`);
+          await appendFile(process.env.GITHUB_STEP_SUMMARY, `### ${config.name}\n\n${out.url}\n`);
+          JS
