@@ -6,7 +6,7 @@ on:
       labs-url:
         description: Base URL of the labs Worker
         type: string
-        default: https://labs.imgly-labs.workers.dev
+        default: https://labs.imgly.dev
 
 permissions:
   contents: read
