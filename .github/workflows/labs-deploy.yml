@@ -35,6 +35,9 @@ jobs:
       matrix:
         project: ${{ fromJson(needs.discover.outputs.projects) }}
     name: deploy ${{ matrix.project }}
+    concurrency:
+      group: labs-${{ github.repository }}-${{ matrix.project }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -66,15 +69,24 @@ jobs:
           const labs = process.env.LABS_URL;
           const configText = await readFile(path.join(dir, ".imgly-labs.json"), "utf8");
           const config = JSON.parse(configText);
-          const assetsDir = path.join(dir, config.assets ?? ".");
-          const SKIP = new Set([".git", ".github", "node_modules"]);
+          const projectDir = path.resolve(dir);
+          const assetsDir = path.resolve(projectDir, config.assets ?? ".");
+          if (assetsDir !== projectDir && !assetsDir.startsWith(projectDir + path.sep)) {
+            console.log(`::error::assets must stay inside ${dir}`);
+            process.exit(1);
+          }
 
-          async function* walk(d) {
+          // Dotfiles (.env, .npmrc, ...) are never published, except /.well-known.
+          // Nested folders with their own .imgly-labs.json are separate projects.
+          async function* walk(d, top) {
             for (const e of await readdir(d, { withFileTypes: true })) {
-              if (SKIP.has(e.name)) continue;
+              if (e.name.startsWith(".") && !(top && e.name === ".well-known" && e.isDirectory())) continue;
+              if (e.name === "node_modules") continue;
               const p = path.join(d, e.name);
-              if (e.isDirectory()) yield* walk(p);
-              else if (e.isFile()) yield p;
+              if (e.isDirectory()) {
+                const nested = await readFile(path.join(p, ".imgly-labs.json")).then(() => true, () => false);
+                if (!nested) yield* walk(p, false);
+              } else if (e.isFile()) yield p;
             }
           }
 
@@ -82,9 +94,8 @@ jobs:
           form.append("config", configText);
           form.append("path", dir);
           let count = 0;
-          for await (const file of walk(assetsDir)) {
+          for await (const file of walk(assetsDir, true)) {
             const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
-            if (rel === "/.imgly-labs.json") continue;
             form.append(`file:${rel}`, new Blob([await readFile(file)]), path.basename(file));
             count++;
           }
