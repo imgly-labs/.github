@@ -56,10 +56,23 @@ jobs:
           fi
           bash -c "$build"
 
+      - name: Bundle worker code
+        id: bundle
+        working-directory: ${{ matrix.project }}
+        run: |
+          main=$(jq -r '.main // empty' .imgly-labs.json)
+          if [ -z "$main" ]; then echo "No worker code"; exit 0; fi
+          out="$RUNNER_TEMP/labs-app-${{ strategy.job-index }}.js"
+          npx -y esbuild@0.25.10 "$main" --bundle --format=esm --platform=neutral --target=es2022 \
+            --conditions=workerd,worker,browser --main-fields=module,main \
+            --external:'cloudflare:*' --external:'node:*' --outfile="$out"
+          echo "app=$out" >> "$GITHUB_OUTPUT"
+
       - name: Deploy
         env:
           PROJECT_DIR: ${{ matrix.project }}
           LABS_URL: ${{ inputs.labs-url }}
+          APP_BUNDLE: ${{ steps.bundle.outputs.app }}
         run: |
           node --input-type=module <<'JS'
           import { appendFile, readFile, readdir } from "node:fs/promises";
@@ -70,8 +83,11 @@ jobs:
           const configText = await readFile(path.join(dir, ".imgly-labs.json"), "utf8");
           const config = JSON.parse(configText);
           const projectDir = path.resolve(dir);
-          const assetsDir = path.resolve(projectDir, config.assets ?? ".");
-          if (assetsDir !== projectDir && !assetsDir.startsWith(projectDir + path.sep)) {
+          const inside = (p) => p === projectDir || p.startsWith(projectDir + path.sep);
+          // Projects with worker code only publish an explicit assets folder, never their sources.
+          const assetsSetting = config.assets ?? (config.main ? null : ".");
+          const assetsDir = assetsSetting === null ? null : path.resolve(projectDir, assetsSetting);
+          if (assetsDir && !inside(assetsDir)) {
             console.log(`::error::assets must stay inside ${dir}`);
             process.exit(1);
           }
@@ -94,10 +110,25 @@ jobs:
           form.append("config", configText);
           form.append("path", dir);
           let count = 0;
-          for await (const file of walk(assetsDir, true)) {
-            const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
-            form.append(`file:${rel}`, new Blob([await readFile(file)]), path.basename(file));
-            count++;
+          if (assetsDir) {
+            for await (const file of walk(assetsDir, true)) {
+              const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
+              form.append(`file:${rel}`, new Blob([await readFile(file)]), path.basename(file));
+              count++;
+            }
+          }
+          if (process.env.APP_BUNDLE) {
+            form.append("worker", new Blob([await readFile(process.env.APP_BUNDLE)]), "app.js");
+          }
+          if (config.migrations) {
+            const migrationsDir = path.resolve(projectDir, config.migrations);
+            if (!inside(migrationsDir)) {
+              console.log(`::error::migrations must stay inside ${dir}`);
+              process.exit(1);
+            }
+            for (const name of (await readdir(migrationsDir)).filter((n) => n.endsWith(".sql")).sort()) {
+              form.append(`migration:${name}`, new Blob([await readFile(path.join(migrationsDir, name))]), name);
+            }
           }
 
           const idRes = await fetch(
@@ -117,7 +148,7 @@ jobs:
             process.exit(1);
           }
           const out = JSON.parse(text);
-          console.log(`Deployed ${count} files`);
+          console.log(`Deployed ${count} files${process.env.APP_BUNDLE ? " and worker code" : ""}`);
           console.log(`Share: ${out.url}`);
           console.log(`Direct: ${out.projectUrl}`);
           await appendFile(process.env.GITHUB_STEP_SUMMARY, `### ${config.name}\n\n${out.url}\n`);
