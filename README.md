@@ -18,6 +18,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    secrets: inherit
 ```
 
 Every directory with a `.imgly-labs.json` is deployed on push to `main`.
+
+Project secrets: a repository or organization secret named `LABS_<ID>_<NAME>` (ID in upper case) is available to that project's Worker code as `env.<NAME>`. Nothing else is forwarded.
