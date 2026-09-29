@@ -41,6 +41,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Repos with Git LFS files (on lfs.imgly.dev) get the real files, not pointers.
+      # The job's own GitHub token authenticates; it never ends up in the git config.
+      - name: Fetch LFS files
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PROJECT: ${{ matrix.project }}
+        run: |
+          if ! git lfs ls-files --name-only | grep -q .; then echo "No LFS files"; exit 0; fi
+          git config --global credential.https://lfs.imgly.dev.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+          if [ "$PROJECT" = "." ]; then include="*"; else include="$PROJECT/**"; fi
+          # --exclude "" overrides a repo's lfs.fetchexclude, which may skip media on normal clones.
+          git lfs pull --include "$include" --exclude ""
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
