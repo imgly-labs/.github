@@ -44,11 +44,14 @@ jobs:
       # Repos with Git LFS files (on lfs.imgly.dev) get the real files, not pointers.
       # The job's own GitHub token authenticates; it never ends up in the git config.
       - name: Fetch LFS files
+        timeout-minutes: 20
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PROJECT: ${{ matrix.project }}
         run: |
           if ! git lfs ls-files --name-only | grep -q .; then echo "No LFS files"; exit 0; fi
+          # Smaller batches keep each request well inside git-lfs's 30 s timeout.
+          git config --global lfs.transfer.batchSize 20
           git config --global credential.https://lfs.imgly.dev.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
           if [ "$PROJECT" = "." ]; then include="*"; else include="$PROJECT/**"; fi
           # --exclude "" overrides a repo's lfs.fetchexclude, which may skip media on normal clones.
@@ -90,6 +93,7 @@ jobs:
           LABS_SECRETS: ${{ toJSON(secrets) }}
         run: |
           node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
           import { appendFile, readFile, readdir } from "node:fs/promises";
           import path from "node:path";
 
@@ -121,15 +125,36 @@ jobs:
             }
           }
 
+          // Files tracked in Git LFS are sent as their oid: labs serves them from lfs.imgly.dev's bucket,
+          // so large media never travels in this request. Matched by path; labs checks the repo pushed the oid.
+          const lfs = new Map();
+          try {
+            const lfsUrl = execFileSync("git", ["config", "-f", ".lfsconfig", "--get", "lfs.url"], { encoding: "utf8" });
+            if (!lfsUrl.startsWith("https://lfs.imgly.dev/")) throw new Error("LFS is not on lfs.imgly.dev");
+            for (const line of execFileSync("git", ["lfs", "ls-files", "--long"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n")) {
+              const m = line.match(/^([0-9a-f]{64}) [*-] (.+)$/);
+              if (m) lfs.set(path.resolve(m[2]), m[1]);
+            }
+          } catch {
+            // No git-lfs, no LFS files, or LFS elsewhere: everything is uploaded as bytes.
+          }
+
           const form = new FormData();
           form.append("config", configText);
           form.append("path", dir);
           let count = 0;
+          let objects = 0;
           if (assetsDir) {
             for await (const file of walk(assetsDir, true)) {
               const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
-              form.append(`file:${rel}`, new Blob([await readFile(file)]), path.basename(file));
-              count++;
+              const oid = lfs.get(file);
+              if (oid) {
+                form.append(`object:${rel}`, oid);
+                objects++;
+              } else {
+                form.append(`file:${rel}`, new Blob([await readFile(file)]), path.basename(file));
+                count++;
+              }
             }
           }
           if (process.env.APP_BUNDLE) {
@@ -166,7 +191,7 @@ jobs:
             process.exit(1);
           }
           const out = JSON.parse(text);
-          console.log(`Deployed ${count} files${process.env.APP_BUNDLE ? " and worker code" : ""}${secrets.length ? `, ${secrets.length} secrets` : ""}`);
+          console.log(`Deployed ${count} files${objects ? `, ${objects} LFS objects` : ""}${process.env.APP_BUNDLE ? " and worker code" : ""}${secrets.length ? `, ${secrets.length} secrets` : ""}`);
           console.log(`Share: ${out.url}`);
           console.log(`Direct: ${out.projectUrl}`);
           await appendFile(process.env.GITHUB_STEP_SUMMARY, `### ${config.name}\n\n${out.url}\n`);
