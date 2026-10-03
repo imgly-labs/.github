@@ -41,8 +41,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Repos with Git LFS files (on lfs.imgly.dev) get the real files, not pointers.
-      # The job's own GitHub token authenticates; it never ends up in the git config.
+      # LFS files stay pointers by default: the deploy sends them as oids and labs serves them from
+      # labs-objects, so their bytes are never downloaded here. They are pulled only when a project asks
+      # for it ("lfs": "pull", for builds that process the bytes) or when LFS is not on lfs.imgly.dev
+      # (then the bytes must be uploaded). The job's own GitHub token authenticates; it never ends up in the git config.
       - name: Fetch LFS files
         timeout-minutes: 20
         env:
@@ -50,6 +52,11 @@ jobs:
           PROJECT: ${{ matrix.project }}
         run: |
           if ! git lfs ls-files --name-only | grep -q .; then echo "No LFS files"; exit 0; fi
+          url=$(git config -f .lfsconfig --get lfs.url || true)
+          mode=$(jq -r '.lfs // "pointer"' "$PROJECT/.imgly-labs.json")
+          if [ "$mode" != "pull" ] && [ "${url#https://lfs.imgly.dev/}" != "$url" ]; then
+            echo "LFS files stay pointers (download on demand: \"lfs\": \"pull\" in .imgly-labs.json)"; exit 0
+          fi
           # Smaller batches keep each request well inside git-lfs's 30 s timeout.
           git config --global lfs.transfer.batchSize 20
           git config --global credential.https://lfs.imgly.dev.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
@@ -94,7 +101,7 @@ jobs:
         run: |
           node --input-type=module <<'JS'
           import { execFileSync } from "node:child_process";
-          import { appendFile, readFile, readdir } from "node:fs/promises";
+          import { appendFile, readFile, readdir, stat } from "node:fs/promises";
           import path from "node:path";
 
           const dir = process.env.PROJECT_DIR;
@@ -128,9 +135,17 @@ jobs:
           // Files tracked in Git LFS are sent as their oid: labs serves them from lfs.imgly.dev's bucket,
           // so large media never travels in this request. Matched by path; labs checks the repo pushed the oid.
           const lfs = new Map();
+          let lfsHere = false;
+          async function pointerOid(file) {
+            const { size } = await stat(file);
+            if (size > 1024) return null;
+            const m = (await readFile(file, "utf8")).match(/^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:([0-9a-f]{64})\nsize \d+\n?$/);
+            return m ? m[1] : null;
+          }
           try {
             const lfsUrl = execFileSync("git", ["config", "-f", ".lfsconfig", "--get", "lfs.url"], { encoding: "utf8" });
             if (!lfsUrl.startsWith("https://lfs.imgly.dev/")) throw new Error("LFS is not on lfs.imgly.dev");
+            lfsHere = true;
             for (const line of execFileSync("git", ["lfs", "ls-files", "--long"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).split("\n")) {
               const m = line.match(/^([0-9a-f]{64}) [*-] (.+)$/);
               if (m) lfs.set(path.resolve(m[2]), m[1]);
@@ -147,7 +162,9 @@ jobs:
           if (assetsDir) {
             for await (const file of walk(assetsDir, true)) {
               const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
-              const oid = lfs.get(file);
+              let oid = lfs.get(file);
+              // A pointer copied by a build (public/ -> dist/) is recognised by its content.
+              if (!oid && lfsHere) oid = await pointerOid(file);
               if (oid) {
                 form.append(`object:${rel}`, oid);
                 objects++;
