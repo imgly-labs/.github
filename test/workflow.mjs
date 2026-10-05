@@ -1,7 +1,7 @@
 // Runs the inline scripts of .github/workflows/labs-deploy.yml outside GitHub Actions.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -43,7 +43,7 @@ export function runStep(stepName, { cwd, env = {} }) {
 
 /** A git repo with `files` committed; returns its path and a commit() that adds more. */
 export function gitRepo(files) {
-  const dir = mkdtempSync(path.join(tmpdir(), "labs-repo-"));
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "labs-repo-")));
   const git = (...args) => execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
   git("init", "-q", "-b", "main");
   git("config", "user.email", "t@example.com");
@@ -62,6 +62,7 @@ export function gitRepo(files) {
 
 /** Like runStep, but async so an in-process fake server can answer the script. */
 export function runStepAsync(stepName, { cwd, env = {} }) {
+  const script = scriptOf(stepName);
   const dir = mkdtempSync(path.join(tmpdir(), "labs-step-"));
   const output = path.join(dir, "output");
   const summary = path.join(dir, "summary");
@@ -77,7 +78,7 @@ export function runStepAsync(stepName, { cwd, env = {} }) {
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
     child.on("close", (status) => resolve({ status, stdout, stderr, output: readFileSync(output, "utf8") }));
-    child.stdin.end(scriptOf(stepName));
+    child.stdin.end(script);
   });
 }
 

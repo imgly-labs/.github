@@ -58,3 +58,20 @@ describe("Deploy", () => {
     assert.doesNotMatch(res.stdout + res.stderr, /not json/);
   });
 });
+
+describe("Deploy with container images", () => {
+  let labs;
+  before(async () => {
+    labs = await fakeLabs({ "POST /deploy": () => Response.json({ url: "u", projectUrl: "p" }) });
+  });
+  after(() => labs.close());
+
+  it("sends each pushed image as a container:<class>:<image> part", async () => {
+    const r = gitRepo({ "apps/a/.imgly-labs.json": project("aaaaaaaa"), "apps/a/index.html": "a" });
+    const IMAGES = JSON.stringify({ "Engine:server": "registry.cloudflare.com/ns/labs-aaaaaaaa-server@sha256:" + "a".repeat(64) });
+    const res = await runStepAsync("Deploy", { cwd: r.dir, env: { ...labs.env, PROJECT_DIR: "apps/a", IMAGES } });
+    assert.equal(res.status, 0, res.stdout + res.stderr);
+    const form = labs.requests.find((q) => q.path === "/deploy").body;
+    assert.equal(form.get("container:Engine:server"), JSON.parse(IMAGES)["Engine:server"]);
+  });
+});

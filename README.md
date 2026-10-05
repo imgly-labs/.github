@@ -46,3 +46,13 @@ jobs:
 ```
 
 The workflow still forwards only `LABS_<ID>_*` keys, each to its own project; values stay masked in logs. If a name is both inherited and in `LABS_SECRETS`, `LABS_SECRETS` wins.
+
+## Containers
+
+A project with `"containers"` in `.imgly-labs.json` gets its images built and pushed by the workflow, after the project's build:
+
+1. The workflow asks labs (`POST /deploy/registry`, with the job's OIDC token) for registry credentials. Labs checks the token, the branch and that this repo and path own the project id, and returns credentials for Cloudflare's registry that expire after 60 minutes. The repo holds no Cloudflare credentials.
+2. Each image is built with `docker buildx build --platform linux/amd64 --push` from its `dockerfile` and `context` (default: the Dockerfile's directory). Both are relative to the project directory and may point anywhere inside the repository, e.g. a monorepo root.
+3. The deploy sends the pushed digests; labs runs only those.
+
+Git LFS files are fetched for the project directory only. A build context outside it that needs LFS files must fetch them in the project's `build`.

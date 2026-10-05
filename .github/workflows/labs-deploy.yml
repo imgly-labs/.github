@@ -164,11 +164,103 @@ jobs:
             --external:'cloudflare:*' --external:'node:*' --outfile="$out"
           echo "app=$out" >> "$GITHUB_OUTPUT"
 
+      # Container images go to Cloudflare's registry with short-lived credentials from labs: the repo holds none.
+      - name: Build container images
+        id: images
+        env:
+          PROJECT_DIR: ${{ matrix.project }}
+          LABS_URL: ${{ inputs.labs-url }}
+        run: |
+          node --input-type=module <<'JS'
+          import { spawnSync } from "node:child_process";
+          import { appendFileSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+          import { tmpdir } from "node:os";
+          import path from "node:path";
+
+          const dir = process.env.PROJECT_DIR;
+          const docker = process.env.DOCKER || "docker";
+          const configText = readFileSync(path.join(dir, ".imgly-labs.json"), "utf8");
+          const config = JSON.parse(configText);
+          const containers = Array.isArray(config.containers) ? config.containers : [];
+          if (!containers.length) {
+            console.log("No containers");
+            process.exit(0);
+          }
+
+          // Dockerfiles and build contexts may reach outside the project (monorepos), never outside the checkout.
+          const root = realpathSync(process.env.GITHUB_WORKSPACE || ".");
+          const projectDir = realpathSync(dir);
+          const inRepo = (p) => p === root || p.startsWith(root + path.sep);
+          const builds = [];
+          for (const c of containers) {
+            for (const [image, spec] of Object.entries(c.images ?? {})) {
+              const dockerfile = path.resolve(projectDir, String(spec.dockerfile));
+              const context = spec.context === undefined ? path.dirname(dockerfile) : path.resolve(projectDir, String(spec.context));
+              if (!inRepo(dockerfile) || !inRepo(context)) {
+                console.log(`::error::${c.class}:${image}: dockerfile and context must stay inside the repository`);
+                process.exit(1);
+              }
+              builds.push({ key: `${c.class}:${image}`, image, dockerfile, context });
+            }
+          }
+
+          const idRes = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encodeURIComponent(process.env.LABS_URL)}`, {
+            headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          const { value: token } = await idRes.json();
+          const res = await fetch(`${process.env.LABS_URL}/deploy/registry`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ config: configText, path: dir }),
+          });
+          const text = await res.text();
+          if (!res.ok) {
+            console.log(`::error::Registry credentials for ${dir} refused (${res.status}): ${text}`);
+            process.exit(1);
+          }
+          const access = JSON.parse(text);
+          console.log(`::add-mask::${access.password}`);
+
+          const run = (args, input) => {
+            const r = spawnSync(docker, args, { stdio: [input === undefined ? "inherit" : "pipe", "inherit", "inherit"], input });
+            if (r.status !== 0) throw new Error(`docker ${args[0]} ${args[1] ?? ""} failed`);
+          };
+          const images = {};
+          let failed = false;
+          try {
+            run(["login", "--username", access.username, "--password-stdin", access.registry], access.password);
+            const tmp = mkdtempSync(path.join(tmpdir(), "labs-images-"));
+            for (const [i, b] of builds.entries()) {
+              const repository = access.repositories[b.image];
+              const meta = path.join(tmp, `${i}.json`);
+              console.log(`::group::${b.key} -> ${repository}`);
+              // A plain amd64 manifest: Containers run linux/amd64 and take no attestation indexes.
+              run([
+                "buildx", "build", "--platform", "linux/amd64", "--provenance=false", "--sbom=false",
+                "-f", b.dockerfile, "-t", `${repository}:${process.env.GITHUB_SHA}`, "--push", "--metadata-file", meta, b.context,
+              ]);
+              console.log("::endgroup::");
+              const digest = JSON.parse(readFileSync(meta, "utf8"))["containerimage.digest"];
+              if (!/^sha256:[0-9a-f]{64}$/.test(digest ?? "")) throw new Error(`no digest for ${b.key}`);
+              images[b.key] = `${repository}@${digest}`;
+            }
+          } catch (e) {
+            console.log(`::error::${e.message}`);
+            failed = true;
+          } finally {
+            spawnSync(docker, ["logout", access.registry], { stdio: "inherit" });
+          }
+          if (failed) process.exit(1);
+          console.log(`Pushed ${Object.keys(images).length} images`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `images=${JSON.stringify(images)}\n`);
+          JS
+
       - name: Deploy
         env:
           PROJECT_DIR: ${{ matrix.project }}
           LABS_URL: ${{ inputs.labs-url }}
           APP_BUNDLE: ${{ steps.bundle.outputs.app }}
+          IMAGES: ${{ steps.images.outputs.images }}
           # `secrets: inherit` (same org) or the LABS_SECRETS JSON map (any org). Only LABS_<ID>_* secrets are forwarded.
           ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
@@ -237,6 +329,7 @@ jobs:
               }
             }
           }
+          for (const [key, ref] of Object.entries(JSON.parse(process.env.IMAGES || "{}"))) form.append(`container:${key}`, ref);
           if (process.env.APP_BUNDLE) {
             form.append("worker", new Blob([await readFile(process.env.APP_BUNDLE)]), "app.js");
           }
