@@ -19,16 +19,89 @@ jobs:
       projects: ${{ steps.find.outputs.projects }}
     steps:
       - uses: actions/checkout@v4
-      - id: find
+        with:
+          # History (without blobs) to diff the push against its base.
+          fetch-depth: 0
+          filter: blob:none
+      - name: Find projects to deploy
+        id: find
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
-          projects=$(find . -name .imgly-labs.json -not -path '*/node_modules/*' -not -path './.git/*' -printf '%h\n' \
-            | sed 's#^\./##' | sort | jq -R . | jq -sc .)
-          echo "Found projects: $projects"
-          echo "projects=$projects" >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { appendFileSync, readFileSync } from "node:fs";
+          import path from "node:path";
+
+          const { EVENT_NAME: event, REF: ref, BEFORE: before, SHA: sha } = process.env;
+          const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+
+          // Each tracked .imgly-labs.json is a project; it deploys from its "branch" (default main).
+          const projects = [];
+          for (const file of git("ls-files", "-z", "--", ".imgly-labs.json", ":(glob)**/.imgly-labs.json").split("\0").filter(Boolean)) {
+            if (file.split("/").includes("node_modules")) continue;
+            let config;
+            try {
+              config = JSON.parse(readFileSync(file, "utf8"));
+            } catch (e) {
+              console.log(`::error::${file} is not valid JSON: ${e.message}`);
+              process.exit(1);
+            }
+            const dir = path.posix.dirname(file);
+            const branch = typeof config.branch === "string" ? config.branch : "main";
+            const watch = Array.isArray(config.watch) ? config.watch.filter((w) => typeof w === "string") : [];
+            if (ref === `refs/heads/${branch}`) projects.push({ dir, watch });
+          }
+
+          // Glob over repo-root paths: ** spans directories, * and ? stay within one; no glob = the path or anything below it.
+          function matcher(pattern) {
+            const p = pattern.replace(/^\.\//, "").replace(/\/+$/, "");
+            if (!/[*?]/.test(p)) return (f) => f === p || f.startsWith(p + "/");
+            let re = "";
+            for (let i = 0; i < p.length; i++) {
+              const c = p[i];
+              if (c === "*" && p[i + 1] === "*") {
+                const slash = p[i + 2] === "/";
+                re += slash ? "(?:.*/)?" : ".*";
+                i += slash ? 2 : 1;
+              } else if (c === "*") re += "[^/]*";
+              else if (c === "?") re += "[^/]";
+              else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+            }
+            const rx = new RegExp(`^${re}$`);
+            return (f) => rx.test(f);
+          }
+
+          let selected = [];
+          if (event === "workflow_dispatch") {
+            selected = projects;
+          } else if (event === "push") {
+            let changed = null;
+            if (before && !/^0+$/.test(before)) {
+              try {
+                changed = git("diff", "--name-only", "-z", before, sha).split("\0").filter(Boolean);
+              } catch {
+                console.log(`Cannot diff ${before}..${sha} (force push?): deploying every project of ${ref}`);
+              }
+            }
+            selected = changed === null
+              ? projects
+              : projects.filter(({ dir, watch }) => {
+                  const matches = [dir === "." ? () => true : matcher(dir), ...watch.map(matcher)];
+                  return changed.some((f) => matches.some((m) => m(f)));
+                });
+          }
+          const out = selected.map((p) => p.dir).sort();
+          console.log(`Projects to deploy: ${JSON.stringify(out)}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `projects=${JSON.stringify(out)}\n`);
+          JS
 
   deploy:
     needs: discover
-    if: github.ref == 'refs/heads/main' && needs.discover.outputs.projects != '[]'
+    if: needs.discover.outputs.projects != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -52,6 +125,7 @@ jobs:
           if ! git lfs ls-files --name-only | grep -q .; then echo "No LFS files"; exit 0; fi
           # Smaller batches keep each request well inside git-lfs's 30 s timeout.
           git config --global lfs.transfer.batchSize 20
+          # shellcheck disable=SC2016 # $GITHUB_TOKEN is expanded by the helper at use, not stored.
           git config --global credential.https://lfs.imgly.dev.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
           if [ "$PROJECT" = "." ]; then include="*"; else include="$PROJECT/**"; fi
           # --exclude "" overrides a repo's lfs.fetchexclude, which may skip media on normal clones.

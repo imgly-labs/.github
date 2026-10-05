@@ -21,7 +21,14 @@ jobs:
     secrets: inherit
 ```
 
-Every directory with a `.imgly-labs.json` is deployed on push to `main`.
+Every directory with a `.imgly-labs.json` is a project. A push deploys the projects that
+
+- deploy from the pushed branch: `"branch"` in `.imgly-labs.json`, default `main` (add the branch to `on.push.branches`), and
+- changed in that push: a file in the project's directory, or a file matching one of its `"watch"` paths.
+
+`watch` lists paths from the repository root that the project's build depends on, for monorepos: `"watch": ["packages/codesign-sdk/**", "pnpm-lock.yaml"]`. `**` spans directories, `*` and `?` match within one; a path without wildcards matches itself and everything below it.
+
+A manual run (`workflow_dispatch`) deploys every project of the branch it runs on. So does a push whose base is unknown (a new branch, a force push).
 
 Project secrets: a repository or organization secret named `LABS_<ID>_<NAME>` (ID in upper case) is available to that project's Worker code as `env.<NAME>`. Nothing else is forwarded.
 
