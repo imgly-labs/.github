@@ -155,14 +155,63 @@ jobs:
       - name: Bundle worker code
         id: bundle
         working-directory: ${{ matrix.project }}
+        env:
+          JOB_INDEX: ${{ strategy.job-index }}
         run: |
-          main=$(jq -r '.main // empty' .imgly-labs.json)
-          if [ -z "$main" ]; then echo "No worker code"; exit 0; fi
-          out="$RUNNER_TEMP/labs-app-${{ strategy.job-index }}.js"
-          npx -y esbuild@0.25.10 "$main" --bundle --format=esm --platform=neutral --target=es2022 \
-            --conditions=workerd,worker,browser --main-fields=module,main \
-            --external:'cloudflare:*' --external:'node:*' --outfile="$out"
-          echo "app=$out" >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { appendFileSync, readFileSync } from "node:fs";
+          import { builtinModules, createRequire } from "node:module";
+          import path from "node:path";
+
+          const { main } = JSON.parse(readFileSync(".imgly-labs.json", "utf8"));
+          if (!main) {
+            console.log("No worker code");
+            process.exit(0);
+          }
+          const tools = path.join(process.env.RUNNER_TEMP, "labs-esbuild");
+          execFileSync("npm", ["install", "--prefix", tools, "--no-save", "--no-audit", "--no-fund", "--loglevel=error", "esbuild@0.25.10"], { stdio: "inherit" });
+          const esbuild = createRequire(path.join(tools, "package.json"))("esbuild");
+
+          // Like wrangler with nodejs_compat: Node built-ins stay external as node: imports, and require() of one
+          // (in CommonJS dependencies) becomes an import, since ES module output has no require at runtime.
+          const builtins = new Set(builtinModules);
+          const nodeBuiltins = {
+            name: "labs-node-builtins",
+            setup(build) {
+              build.onResolve({ filter: /^(node:)?[a-z_][a-z0-9_/]*$/ }, (args) => {
+                const name = args.path.replace(/^node:/, "");
+                if (!args.path.startsWith("node:") && !builtins.has(name)) return undefined;
+                if (args.kind === "require-call") return { path: name, namespace: "labs-node-require" };
+                return { path: `node:${name}`, external: true };
+              });
+              build.onLoad({ filter: /.*/, namespace: "labs-node-require" }, (args) => ({
+                contents: `import lib from "node:${args.path}";\nmodule.exports = lib;`,
+                loader: "js",
+              }));
+            },
+          };
+
+          const out = path.join(process.env.RUNNER_TEMP, `labs-app-${process.env.JOB_INDEX}.js`);
+          try {
+            await esbuild.build({
+              entryPoints: [main],
+              bundle: true,
+              format: "esm",
+              platform: "neutral",
+              target: "es2022",
+              conditions: ["workerd", "worker", "browser"],
+              mainFields: ["module", "main"],
+              external: ["cloudflare:*"],
+              plugins: [nodeBuiltins],
+              outfile: out,
+              logLevel: "warning",
+            });
+          } catch {
+            process.exit(1);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `app=${out}\n`);
+          JS
 
       # Container images go to Cloudflare's registry with short-lived credentials from labs: the repo holds none.
       - name: Build container images
