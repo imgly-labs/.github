@@ -7,6 +7,12 @@ on:
         description: Base URL of the labs Worker
         type: string
         default: https://labs.imgly.dev
+    secrets:
+      LABS_SECRETS:
+        description: >-
+          JSON object of LABS_<ID>_<NAME> secrets, usually the caller's toJSON(secrets). For callers outside
+          imgly-labs, where `secrets: inherit` does not reach this workflow. Only LABS_<ID>_* keys are used.
+        required: false
 
 permissions:
   contents: read
@@ -163,8 +169,8 @@ jobs:
           PROJECT_DIR: ${{ matrix.project }}
           LABS_URL: ${{ inputs.labs-url }}
           APP_BUNDLE: ${{ steps.bundle.outputs.app }}
-          # Requires `secrets: inherit` in the calling workflow. Only LABS_<ID>_* secrets are forwarded.
-          LABS_SECRETS: ${{ toJSON(secrets) }}
+          # `secrets: inherit` (same org) or the LABS_SECRETS JSON map (any org). Only LABS_<ID>_* secrets are forwarded.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
           node --input-type=module <<'JS'
           import { execFileSync } from "node:child_process";
@@ -235,7 +241,23 @@ jobs:
             form.append("worker", new Blob([await readFile(process.env.APP_BUNDLE)]), "app.js");
           }
           const prefix = `LABS_${config.id.toUpperCase()}_`;
-          const secrets = Object.entries(JSON.parse(process.env.LABS_SECRETS || "{}")).filter(([k]) => k.startsWith(prefix) && k.length > prefix.length);
+          const { LABS_SECRETS: explicit, ...inherited } = JSON.parse(process.env.ALL_SECRETS || "{}");
+          let passed = {};
+          if (explicit) {
+            try {
+              passed = JSON.parse(explicit);
+            } catch {
+              passed = null;
+            }
+            if (typeof passed !== "object" || passed === null || Array.isArray(passed)) {
+              console.log("::error::LABS_SECRETS must be a JSON object, e.g. the caller's toJSON(secrets)");
+              process.exit(1);
+            }
+          }
+          // The explicit map wins over an inherited secret of the same name.
+          const secrets = Object.entries({ ...inherited, ...passed }).filter(
+            ([k, v]) => k.startsWith(prefix) && k.length > prefix.length && typeof v === "string"
+          );
           for (const [key, value] of secrets) form.append(`secret:${key.slice(prefix.length)}`, value);
           if (config.migrations) {
             const migrationsDir = path.resolve(projectDir, config.migrations);

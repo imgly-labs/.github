@@ -32,4 +32,17 @@ A manual run (`workflow_dispatch`) deploys every project of the branch it runs o
 
 Project secrets: a repository or organization secret named `LABS_<ID>_<NAME>` (ID in upper case) is available to that project's Worker code as `env.<NAME>`. Nothing else is forwarded.
 
-Repositories outside `imgly-labs` (allowed orgs: `imgly`) use the same workflow file. GitHub does not pass `secrets: inherit` across organizations, so their projects deploy without `LABS_<ID>_*` secrets.
+Repositories outside `imgly-labs` (allowed orgs: `imgly`) use the same workflow file. GitHub does not pass `secrets: inherit` across organizations, so they pass their secrets as one JSON value instead:
+
+```yaml
+jobs:
+  labs:
+    uses: imgly-labs/.github/.github/workflows/labs-deploy.yml@main
+    permissions:
+      contents: read
+      id-token: write
+    secrets:
+      LABS_SECRETS: ${{ toJSON(secrets) }}
+```
+
+The workflow still forwards only `LABS_<ID>_*` keys, each to its own project; values stay masked in logs. If a name is both inherited and in `LABS_SECRETS`, `LABS_SECRETS` wins.
