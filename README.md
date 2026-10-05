@@ -28,6 +28,8 @@ Every directory with a `.imgly-labs.json` is a project. A push deploys the proje
 
 `watch` lists paths from the repository root that the project's build depends on, for monorepos: `"watch": ["packages/codesign-sdk/**", "pnpm-lock.yaml"]`. `**` spans directories, `*` and `?` match within one; a path without wildcards matches itself and everything below it.
 
+Before `build`, dependencies are installed where the nearest lockfile is, looking from the project up to the repository root: `pnpm install --frozen-lockfile` or `npm ci`, so a monorepo package gets the workspace install. Without any lockfile, a project with a `package.json` gets `npm install`. Anything else (e.g. a package outside the workspace) is installed by `build`.
+
 A manual run (`workflow_dispatch`) deploys every project of the branch it runs on. So does a push whose base is unknown (a new branch, a force push).
 
 Project secrets: a repository or organization secret named `LABS_<ID>_<NAME>` (ID in upper case) is available to that project's Worker code as `env.<NAME>`. Nothing else is forwarded.

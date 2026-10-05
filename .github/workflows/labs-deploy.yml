@@ -144,13 +144,39 @@ jobs:
       - name: Build
         working-directory: ${{ matrix.project }}
         run: |
-          build=$(jq -r '.build // empty' .imgly-labs.json)
-          if [ -z "$build" ]; then echo "No build step"; exit 0; fi
-          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci
-          elif [ -f package.json ]; then npm install
-          fi
-          bash -c "$build"
+          node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { existsSync, readFileSync, realpathSync } from "node:fs";
+          import path from "node:path";
+
+          const { build } = JSON.parse(readFileSync(".imgly-labs.json", "utf8"));
+          if (!build) {
+            console.log("No build step");
+            process.exit(0);
+          }
+          const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: "inherit" });
+          // Install where the lockfile is: the project itself, or the workspace root of a monorepo package.
+          const root = realpathSync(process.env.GITHUB_WORKSPACE || ".");
+          const project = realpathSync(".");
+          let installed = false;
+          for (let dir = project; dir === root || dir.startsWith(root + path.sep); dir = path.dirname(dir)) {
+            if (existsSync(path.join(dir, "pnpm-lock.yaml"))) {
+              run("corepack", ["enable"], dir);
+              run("pnpm", ["install", "--frozen-lockfile"], dir);
+              installed = true;
+            } else if (existsSync(path.join(dir, "package-lock.json"))) {
+              run("npm", ["ci"], dir);
+              installed = true;
+            }
+            if (installed || dir === root) break;
+          }
+          if (!installed && existsSync("package.json")) run("npm", ["install"], project);
+          try {
+            run("bash", ["-c", build], project);
+          } catch {
+            process.exit(1);
+          }
+          JS
 
       - name: Bundle worker code
         id: bundle
