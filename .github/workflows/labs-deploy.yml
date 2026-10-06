@@ -7,6 +7,12 @@ on:
         description: Base URL of the labs Worker
         type: string
         default: https://labs.imgly.dev
+    secrets:
+      LABS_SECRETS:
+        description: >-
+          JSON object of LABS_<ID>_<NAME> secrets, usually the caller's toJSON(secrets). For callers outside
+          imgly-labs, where `secrets: inherit` does not reach this workflow. Only LABS_<ID>_* keys are used.
+        required: false
 
 permissions:
   contents: read
@@ -19,16 +25,89 @@ jobs:
       projects: ${{ steps.find.outputs.projects }}
     steps:
       - uses: actions/checkout@v4
-      - id: find
+        with:
+          # History (without blobs) to diff the push against its base.
+          fetch-depth: 0
+          filter: blob:none
+      - name: Find projects to deploy
+        id: find
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
         run: |
-          projects=$(find . -name .imgly-labs.json -not -path '*/node_modules/*' -not -path './.git/*' -printf '%h\n' \
-            | sed 's#^\./##' | sort | jq -R . | jq -sc .)
-          echo "Found projects: $projects"
-          echo "projects=$projects" >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { appendFileSync, readFileSync } from "node:fs";
+          import path from "node:path";
+
+          const { EVENT_NAME: event, REF: ref, BEFORE: before, SHA: sha } = process.env;
+          const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+
+          // Each tracked .imgly-labs.json is a project; it deploys from its "branch" (default main).
+          const projects = [];
+          for (const file of git("ls-files", "-z", "--", ".imgly-labs.json", ":(glob)**/.imgly-labs.json").split("\0").filter(Boolean)) {
+            if (file.split("/").includes("node_modules")) continue;
+            let config;
+            try {
+              config = JSON.parse(readFileSync(file, "utf8"));
+            } catch (e) {
+              console.log(`::error::${file} is not valid JSON: ${e.message}`);
+              process.exit(1);
+            }
+            const dir = path.posix.dirname(file);
+            const branch = typeof config.branch === "string" ? config.branch : "main";
+            const watch = Array.isArray(config.watch) ? config.watch.filter((w) => typeof w === "string") : [];
+            if (ref === `refs/heads/${branch}`) projects.push({ dir, watch });
+          }
+
+          // Glob over repo-root paths: ** spans directories, * and ? stay within one; no glob = the path or anything below it.
+          function matcher(pattern) {
+            const p = pattern.replace(/^\.\//, "").replace(/\/+$/, "");
+            if (!/[*?]/.test(p)) return (f) => f === p || f.startsWith(p + "/");
+            let re = "";
+            for (let i = 0; i < p.length; i++) {
+              const c = p[i];
+              if (c === "*" && p[i + 1] === "*") {
+                const slash = p[i + 2] === "/";
+                re += slash ? "(?:.*/)?" : ".*";
+                i += slash ? 2 : 1;
+              } else if (c === "*") re += "[^/]*";
+              else if (c === "?") re += "[^/]";
+              else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+            }
+            const rx = new RegExp(`^${re}$`);
+            return (f) => rx.test(f);
+          }
+
+          let selected = [];
+          if (event === "workflow_dispatch") {
+            selected = projects;
+          } else if (event === "push") {
+            let changed = null;
+            if (before && !/^0+$/.test(before)) {
+              try {
+                changed = git("diff", "--name-only", "-z", before, sha).split("\0").filter(Boolean);
+              } catch {
+                console.log(`Cannot diff ${before}..${sha} (force push?): deploying every project of ${ref}`);
+              }
+            }
+            selected = changed === null
+              ? projects
+              : projects.filter(({ dir, watch }) => {
+                  const matches = [dir === "." ? () => true : matcher(dir), ...watch.map(matcher)];
+                  return changed.some((f) => matches.some((m) => m(f)));
+                });
+          }
+          const out = selected.map((p) => p.dir).sort();
+          console.log(`Projects to deploy: ${JSON.stringify(out)}`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `projects=${JSON.stringify(out)}\n`);
+          JS
 
   deploy:
     needs: discover
-    if: github.ref == 'refs/heads/main' && needs.discover.outputs.projects != '[]'
+    if: needs.discover.outputs.projects != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -52,6 +131,7 @@ jobs:
           if ! git lfs ls-files --name-only | grep -q .; then echo "No LFS files"; exit 0; fi
           # Smaller batches keep each request well inside git-lfs's 30 s timeout.
           git config --global lfs.transfer.batchSize 20
+          # shellcheck disable=SC2016 # $GITHUB_TOKEN is expanded by the helper at use, not stored.
           git config --global credential.https://lfs.imgly.dev.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
           if [ "$PROJECT" = "." ]; then include="*"; else include="$PROJECT/**"; fi
           # --exclude "" overrides a repo's lfs.fetchexclude, which may skip media on normal clones.
@@ -64,33 +144,200 @@ jobs:
       - name: Build
         working-directory: ${{ matrix.project }}
         run: |
-          build=$(jq -r '.build // empty' .imgly-labs.json)
-          if [ -z "$build" ]; then echo "No build step"; exit 0; fi
-          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
-          elif [ -f package-lock.json ]; then npm ci
-          elif [ -f package.json ]; then npm install
-          fi
-          bash -c "$build"
+          node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { existsSync, readFileSync, realpathSync } from "node:fs";
+          import path from "node:path";
+
+          const { build } = JSON.parse(readFileSync(".imgly-labs.json", "utf8"));
+          if (!build) {
+            console.log("No build step");
+            process.exit(0);
+          }
+          const run = (cmd, args, cwd) => execFileSync(cmd, args, { cwd, stdio: "inherit" });
+          // Install where the lockfile is: the project itself, or the workspace root of a monorepo package.
+          const root = realpathSync(process.env.GITHUB_WORKSPACE || ".");
+          const project = realpathSync(".");
+          let installed = false;
+          for (let dir = project; dir === root || dir.startsWith(root + path.sep); dir = path.dirname(dir)) {
+            if (existsSync(path.join(dir, "pnpm-lock.yaml"))) {
+              run("corepack", ["enable"], dir);
+              run("pnpm", ["install", "--frozen-lockfile"], dir);
+              installed = true;
+            } else if (existsSync(path.join(dir, "package-lock.json"))) {
+              run("npm", ["ci"], dir);
+              installed = true;
+            }
+            if (installed || dir === root) break;
+          }
+          if (!installed && existsSync("package.json")) run("npm", ["install"], project);
+          try {
+            run("bash", ["-c", build], project);
+          } catch {
+            process.exit(1);
+          }
+          JS
 
       - name: Bundle worker code
         id: bundle
         working-directory: ${{ matrix.project }}
+        env:
+          JOB_INDEX: ${{ strategy.job-index }}
         run: |
-          main=$(jq -r '.main // empty' .imgly-labs.json)
-          if [ -z "$main" ]; then echo "No worker code"; exit 0; fi
-          out="$RUNNER_TEMP/labs-app-${{ strategy.job-index }}.js"
-          npx -y esbuild@0.25.10 "$main" --bundle --format=esm --platform=neutral --target=es2022 \
-            --conditions=workerd,worker,browser --main-fields=module,main \
-            --external:'cloudflare:*' --external:'node:*' --outfile="$out"
-          echo "app=$out" >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'JS'
+          import { execFileSync } from "node:child_process";
+          import { appendFileSync, readFileSync } from "node:fs";
+          import { builtinModules, createRequire } from "node:module";
+          import path from "node:path";
+
+          const { main } = JSON.parse(readFileSync(".imgly-labs.json", "utf8"));
+          if (!main) {
+            console.log("No worker code");
+            process.exit(0);
+          }
+          const tools = path.join(process.env.RUNNER_TEMP, "labs-esbuild");
+          execFileSync("npm", ["install", "--prefix", tools, "--no-save", "--no-audit", "--no-fund", "--loglevel=error", "esbuild@0.25.10"], { stdio: "inherit" });
+          const esbuild = createRequire(path.join(tools, "package.json"))("esbuild");
+
+          // Like wrangler with nodejs_compat: Node built-ins stay external as node: imports, and require() of one
+          // (in CommonJS dependencies) becomes an import, since ES module output has no require at runtime.
+          const builtins = new Set(builtinModules);
+          const nodeBuiltins = {
+            name: "labs-node-builtins",
+            setup(build) {
+              build.onResolve({ filter: /^(node:)?[a-z_][a-z0-9_/]*$/ }, (args) => {
+                const name = args.path.replace(/^node:/, "");
+                if (!args.path.startsWith("node:") && !builtins.has(name)) return undefined;
+                if (args.kind === "require-call") return { path: name, namespace: "labs-node-require" };
+                return { path: `node:${name}`, external: true };
+              });
+              build.onLoad({ filter: /.*/, namespace: "labs-node-require" }, (args) => ({
+                contents: `import lib from "node:${args.path}";\nmodule.exports = lib;`,
+                loader: "js",
+              }));
+            },
+          };
+
+          const out = path.join(process.env.RUNNER_TEMP, `labs-app-${process.env.JOB_INDEX}.js`);
+          try {
+            await esbuild.build({
+              entryPoints: [main],
+              bundle: true,
+              format: "esm",
+              platform: "neutral",
+              target: "es2022",
+              conditions: ["workerd", "worker", "browser"],
+              mainFields: ["module", "main"],
+              external: ["cloudflare:*"],
+              plugins: [nodeBuiltins],
+              outfile: out,
+              logLevel: "warning",
+            });
+          } catch {
+            process.exit(1);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `app=${out}\n`);
+          JS
+
+      # Container images go to Cloudflare's registry with short-lived credentials from labs: the repo holds none.
+      - name: Build container images
+        id: images
+        env:
+          PROJECT_DIR: ${{ matrix.project }}
+          LABS_URL: ${{ inputs.labs-url }}
+        run: |
+          node --input-type=module <<'JS'
+          import { spawnSync } from "node:child_process";
+          import { appendFileSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+          import { tmpdir } from "node:os";
+          import path from "node:path";
+
+          const dir = process.env.PROJECT_DIR;
+          const docker = process.env.DOCKER || "docker";
+          const configText = readFileSync(path.join(dir, ".imgly-labs.json"), "utf8");
+          const config = JSON.parse(configText);
+          const containers = Array.isArray(config.containers) ? config.containers : [];
+          if (!containers.length) {
+            console.log("No containers");
+            process.exit(0);
+          }
+
+          // Dockerfiles and build contexts may reach outside the project (monorepos), never outside the checkout.
+          const root = realpathSync(process.env.GITHUB_WORKSPACE || ".");
+          const projectDir = realpathSync(dir);
+          const inRepo = (p) => p === root || p.startsWith(root + path.sep);
+          const builds = [];
+          for (const c of containers) {
+            for (const [image, spec] of Object.entries(c.images ?? {})) {
+              const dockerfile = path.resolve(projectDir, String(spec.dockerfile));
+              const context = spec.context === undefined ? path.dirname(dockerfile) : path.resolve(projectDir, String(spec.context));
+              if (!inRepo(dockerfile) || !inRepo(context)) {
+                console.log(`::error::${c.class}:${image}: dockerfile and context must stay inside the repository`);
+                process.exit(1);
+              }
+              builds.push({ key: `${c.class}:${image}`, image, dockerfile, context });
+            }
+          }
+
+          const idRes = await fetch(`${process.env.ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${encodeURIComponent(process.env.LABS_URL)}`, {
+            headers: { Authorization: `Bearer ${process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` },
+          });
+          const { value: token } = await idRes.json();
+          const res = await fetch(`${process.env.LABS_URL}/deploy/registry`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ config: configText, path: dir }),
+          });
+          const text = await res.text();
+          if (!res.ok) {
+            console.log(`::error::Registry credentials for ${dir} refused (${res.status}): ${text}`);
+            process.exit(1);
+          }
+          const access = JSON.parse(text);
+          console.log(`::add-mask::${access.password}`);
+
+          const run = (args, input) => {
+            const r = spawnSync(docker, args, { stdio: [input === undefined ? "inherit" : "pipe", "inherit", "inherit"], input });
+            if (r.status !== 0) throw new Error(`docker ${args[0]} ${args[1] ?? ""} failed`);
+          };
+          const images = {};
+          let failed = false;
+          try {
+            run(["login", "--username", access.username, "--password-stdin", access.registry], access.password);
+            const tmp = mkdtempSync(path.join(tmpdir(), "labs-images-"));
+            for (const [i, b] of builds.entries()) {
+              const repository = access.repositories[b.image];
+              const meta = path.join(tmp, `${i}.json`);
+              console.log(`::group::${b.key} -> ${repository}`);
+              // A plain amd64 manifest: Containers run linux/amd64 and take no attestation indexes.
+              run([
+                "buildx", "build", "--platform", "linux/amd64", "--provenance=false", "--sbom=false",
+                "-f", b.dockerfile, "-t", `${repository}:${process.env.GITHUB_SHA}`, "--push", "--metadata-file", meta, b.context,
+              ]);
+              console.log("::endgroup::");
+              const digest = JSON.parse(readFileSync(meta, "utf8"))["containerimage.digest"];
+              if (!/^sha256:[0-9a-f]{64}$/.test(digest ?? "")) throw new Error(`no digest for ${b.key}`);
+              images[b.key] = `${repository}@${digest}`;
+            }
+          } catch (e) {
+            console.log(`::error::${e.message}`);
+            failed = true;
+          } finally {
+            spawnSync(docker, ["logout", access.registry], { stdio: "inherit" });
+          }
+          if (failed) process.exit(1);
+          console.log(`Pushed ${Object.keys(images).length} images`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `images=${JSON.stringify(images)}\n`);
+          JS
 
       - name: Deploy
         env:
           PROJECT_DIR: ${{ matrix.project }}
           LABS_URL: ${{ inputs.labs-url }}
           APP_BUNDLE: ${{ steps.bundle.outputs.app }}
-          # Requires `secrets: inherit` in the calling workflow. Only LABS_<ID>_* secrets are forwarded.
-          LABS_SECRETS: ${{ toJSON(secrets) }}
+          IMAGES: ${{ steps.images.outputs.images }}
+          # `secrets: inherit` (same org) or the LABS_SECRETS JSON map (any org). Only LABS_<ID>_* secrets are forwarded.
+          ALL_SECRETS: ${{ toJSON(secrets) }}
         run: |
           node --input-type=module <<'JS'
           import { execFileSync } from "node:child_process";
@@ -157,11 +404,28 @@ jobs:
               }
             }
           }
+          for (const [key, ref] of Object.entries(JSON.parse(process.env.IMAGES || "{}"))) form.append(`container:${key}`, ref);
           if (process.env.APP_BUNDLE) {
             form.append("worker", new Blob([await readFile(process.env.APP_BUNDLE)]), "app.js");
           }
           const prefix = `LABS_${config.id.toUpperCase()}_`;
-          const secrets = Object.entries(JSON.parse(process.env.LABS_SECRETS || "{}")).filter(([k]) => k.startsWith(prefix) && k.length > prefix.length);
+          const { LABS_SECRETS: explicit, ...inherited } = JSON.parse(process.env.ALL_SECRETS || "{}");
+          let passed = {};
+          if (explicit) {
+            try {
+              passed = JSON.parse(explicit);
+            } catch {
+              passed = null;
+            }
+            if (typeof passed !== "object" || passed === null || Array.isArray(passed)) {
+              console.log("::error::LABS_SECRETS must be a JSON object, e.g. the caller's toJSON(secrets)");
+              process.exit(1);
+            }
+          }
+          // The explicit map wins over an inherited secret of the same name.
+          const secrets = Object.entries({ ...inherited, ...passed }).filter(
+            ([k, v]) => k.startsWith(prefix) && k.length > prefix.length && typeof v === "string"
+          );
           for (const [key, value] of secrets) form.append(`secret:${key.slice(prefix.length)}`, value);
           if (config.migrations) {
             const migrationsDir = path.resolve(projectDir, config.migrations);
