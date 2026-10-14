@@ -95,6 +95,7 @@ jobs:
           node --input-type=module <<'JS'
           import { execFileSync } from "node:child_process";
           import { appendFile, readFile, readdir } from "node:fs/promises";
+          import { createHash } from "node:crypto";
           import path from "node:path";
 
           const dir = process.env.PROJECT_DIR;
@@ -139,6 +140,7 @@ jobs:
             // No git-lfs, no LFS files, or LFS elsewhere: everything is uploaded as bytes.
           }
 
+          const oids = new Set(lfs.values());
           const form = new FormData();
           form.append("config", configText);
           form.append("path", dir);
@@ -147,7 +149,13 @@ jobs:
           if (assetsDir) {
             for await (const file of walk(assetsDir, true)) {
               const rel = "/" + path.relative(assetsDir, file).split(path.sep).join("/");
-              const oid = lfs.get(file);
+              // A build step may copy an LFS file elsewhere (Vite's publicDir into dist): match it by content.
+              let oid = lfs.get(file);
+              if (!oid && oids.size) {
+                const bytes = await readFile(file);
+                const h = createHash("sha256").update(bytes).digest("hex");
+                if (oids.has(h)) oid = h;
+              }
               if (oid) {
                 form.append(`object:${rel}`, oid);
                 objects++;
